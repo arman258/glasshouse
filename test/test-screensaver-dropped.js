@@ -8,6 +8,7 @@ var assert = require('assert');
 var env = require('./mocks/mock-env').createMockEnv();
 env.install();
 var screensavers = require('../server/lib/screensavers');
+var waitFor = require('./wait-for').waitFor;
 
 console.log('Running test-screensaver-dropped.js ...');
 
@@ -16,7 +17,8 @@ function tv(options) {
   var state = {
     requested: false, launched: 0, closed: 0, running: !!options.running,
     closeOK: true, closeReply: null, runningReply: null, watches: [], pointerWatches: [], screenOns: 0,
-    power: 'Active', foreground: 'com.webos.app.home', fronts: 0, media: { state: 'idle', fullScreen: false }
+    power: 'Active', foreground: 'com.webos.app.home', fronts: 0, media: { state: 'idle', fullScreen: false },
+    pipelines: [], pipelineReads: 0
   };
   state.homeVideo = !!options.homeVideo;
   state.luna = function (uri, params, cb) {
@@ -37,6 +39,7 @@ function tv(options) {
       if (state.closeOK) state.running = false;
       return cb(state.closeOK === null ? null : { returnValue: state.closeOK });
     }
+    if (/getActivePipelines$/.test(uri)) { state.pipelineReads++; return cb(state.pipelines); }
     if (/\/running$/.test(uri)) {
       if (state.runningReply) return state.runningReply(cb);
       return cb({ returnValue: true, running: state.running ? [{ id: 'com.webos.app.screensaver' }] : [] });
@@ -44,7 +47,7 @@ function tv(options) {
     throw new Error('Unexpected luna call: ' + uri);
   };
   state.initialise = function () {
-    screensavers.init({ luna: state.luna, config: {}, frontPollMs: 5, injectKey: function (k, cb) { cb(true); }, KEY_BACK: 412,
+    screensavers.init({ luna: state.luna, config: {}, frontPollMs: 5, releaseCheckMs: 5, injectKey: function (k, cb) { cb(true); }, KEY_BACK: 412,
       inputKey: require('../server/lib/names').shortAppId,
       watchKeys: function (on) { state.watches.push(on); },
       watchPointer: function (on) { state.pointerWatches.push(on); },
@@ -317,6 +320,78 @@ test('a video screen saver that ends after a while, or a saver without video, or
     forgetVideoSaver();
   }
   done();
+});
+
+// A G5 (webOS 11.2): Aerial in manual mode played on after a key ended it,
+// holding the decoder, and every H.264 video in the app in front failed (#1661).
+function saverPipeline(resources) {
+  return { id: '_saver', type: 'media', appId: 'com.webos.app.screensaver', mediaState: 'play',
+    resource: resources.map(function (r) { return { resource: r }; }) };
+}
+function endsAfterAWhile(state, cb) {
+  var realNow = Date.now, now = realNow();
+  Date.now = function () { return now; };
+  try {
+    screensavers.onPowerChange('Screen Saver');
+    screensavers.keyPressed();
+    now += 7000;
+    screensavers.onPowerChange('Active');
+  } finally {
+    Date.now = realNow;
+  }
+  waitFor(function () { return state.pipelineReads > 0; }, cb);
+}
+
+test('a video screen saver whose video still holds the decoder after the TV is back is closed', function (done) {
+  var state = videoSaverTv();
+  state.pipelines = [saverPipeline(['VDEC', 'VDEC_INST', 'G1_MSVC'])];
+  endsAfterAWhile(state, function () {
+    waitFor(function () { return state.closed === 1; }, function () {
+      assert.strictEqual(state.launched, 0, 'and not launched again');
+      forgetVideoSaver();
+      done();
+    });
+  });
+});
+
+test('one that let the decoder go, or another app holding it, is left alone', function (done) {
+  var state = videoSaverTv();
+  state.pipelines = [saverPipeline(['ADEC']), { id: '_app', type: 'media', appId: 'com.example.player',
+    resource: [{ resource: 'VDEC' }] }];
+  endsAfterAWhile(state, function () {
+    setTimeout(function () {
+      assert.strictEqual(state.closed, 0);
+      forgetVideoSaver();
+      done();
+    }, 10);
+  });
+});
+
+test('no check after a saver without video, nor once the screen saver is back', function (done) {
+  var state = videoSaverTv('clock');
+  state.pipelines = [saverPipeline(['VDEC'])];
+  screensavers.onPowerChange('Screen Saver');
+  screensavers.keyPressed();
+  screensavers.onPowerChange('Active');
+  state = videoSaverTv();
+  state.pipelines = [saverPipeline(['VDEC'])];
+  var realNow = Date.now, now = realNow();
+  Date.now = function () { return now; };
+  try {
+    screensavers.onPowerChange('Screen Saver');
+    now += 7000;
+    screensavers.onPowerChange('Active');
+    screensavers.onPowerChange('Screen Saver');
+  } finally {
+    Date.now = realNow;
+  }
+  setTimeout(function () {
+    assert.strictEqual(state.pipelineReads, 0, 'nothing read');
+    assert.strictEqual(state.closed, 0);
+    forgetVideoSaver();
+    tv();
+    done();
+  }, 20);
 });
 
 var index = 0;

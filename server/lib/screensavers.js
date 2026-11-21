@@ -886,6 +886,8 @@ function init(opts) {
   wasInScreenSaver = false;
   saverStartedAt = 0;
   saverInputAt = 0;
+  releaseGeneration++;
+  releaseCheckMs = opts.releaseCheckMs !== undefined ? opts.releaseCheckMs : RELEASE_CHECK_MS;
   stagedPlaysVideo = false;
   watchingVideoSaver = false;
   if (opts.videoModeRetryMs !== undefined) videoModeRetryMs = opts.videoModeRetryMs;
@@ -1146,6 +1148,44 @@ function stagedSaverPlaysVideo() {
   var e = m && m !== 'stock' ? saverById(m) : null;
   return !!(e && e.runtime === 'web');
 }
+/*
+ * A video screen saver in manual mode can play on after the TV is back
+ * (#1661): on a G5 (webOS 11.2), with Aerial's QML staged, the screen saver
+ * app's media pipeline stayed in "play" with its 4K HEVC video after a key
+ * ended the screen saver, holding the TV's video decoder (VDEC). Every H.264
+ * video in the app in front then failed with errorCode 601, for days, until
+ * the screen saver app was closed. So a short while after one that plays video
+ * ends, a pipeline the screen saver app still has with a video decoder is
+ * looked for, and the app closed if there is one. tvpower started it, so the
+ * front-app watch for one launched directly does not cover it.
+ */
+var RELEASE_CHECK_MS = 3000;
+var releaseCheckMs = RELEASE_CHECK_MS;
+var releaseGeneration = 0;
+
+function saverPipelineHoldsVideo(list) {
+  return list.some(function (p) {
+    if (!p || String(p.currentAppId || p.appId || '') !== SCREENSAVER_APP_ID || !Array.isArray(p.resource)) return false;
+    return p.resource.some(function (x) { return x && /^VDEC/.test(String(x.resource || '')); });
+  });
+}
+
+function releaseAfterWake() {
+  var mine = ++releaseGeneration;
+  var timer = setTimeout(function () {
+    if (mine !== releaseGeneration || wasInScreenSaver || launchedDirectly || !lunaFn) return;
+    lunaFn('com.webos.media/getActivePipelines', {}, function (r) {
+      if (mine !== releaseGeneration || wasInScreenSaver || launchedDirectly) return;
+      var list = Array.isArray(r) ? r : (r && Array.isArray(r.pipelines) ? r.pipelines : null);
+      if (!list || !saverPipelineHoldsVideo(list)) return;
+      console.log('screensaver: its video still holds the decoder after the TV came back; closing the screen saver app');
+      lunaFn('com.webos.applicationManager/closeByAppId', { id: SCREENSAVER_APP_ID }, function () {});
+    });
+  }, releaseCheckMs);
+  // Not what keeps the server, or a test, running.
+  if (timer.unref) timer.unref();
+}
+
 function videoSaverCut(now) {
   return watchingVideoSaver && !launchedDirectly && saverStartedAt > 0 &&
     now - saverStartedAt < VIDEO_SAVER_CUT_MS && saverInputAt < saverStartedAt;
@@ -1157,17 +1197,20 @@ function onPowerChange(rawState) {
   var now = Date.now();
   if (wasInScreenSaver && !isSS) {
     var cut = videoSaverCut(now);
+    var wasVideoSaver = watchingVideoSaver && !launchedDirectly;
     saverStartedAt = 0;
     if (watchingVideoSaver && !launchedDirectly) watchKeysFn(false);
     watchingVideoSaver = false;
     if (cut) {
       console.log('screensaver: the TV ended it as its video started, with no key pressed; launching it again directly');
       launchScreensaverApp(function () {});
-    } else if (isRandomEnabled()) {
-      advanceRandomSaver();
+    } else {
+      if (wasVideoSaver) releaseAfterWake();
+      if (isRandomEnabled()) advanceRandomSaver();
     }
   }
   if (isSS && !wasInScreenSaver) {
+    releaseGeneration++;
     saverStartedAt = now;
     watchingVideoSaver = slowSwitch() && !launchedDirectly && stagedSaverPlaysVideo();
     if (watchingVideoSaver) watchKeysFn(true);

@@ -320,6 +320,16 @@ does not send it. Whether the mode outlasts a reboot was not seen: Glasshouse
 sent it again 43 s after each of two boots, and the screen saver stayed up
 after both.
 
+In manual mode its video can also outlast the screen saver (#1661). On a G5
+(OLED65G5WUA, webOS 11.2.0), Aerial 3.0.4 staged by Glasshouse 0.154.0,
+`com.webos.media/getActivePipelines` still listed a `media` pipeline for
+`com.webos.app.screensaver` in `mediaState: "play"`, with Aerial's 4K HEVC
+URI and `VDEC`, `VDEC_INST`, `VDEC_BUS` and `G1_MSVC`, while another app was
+in front after a remote key had ended the screen saver. Every H.264 video
+that app started then failed with `errorCode` 601 or stalled, video-only
+clips too; VC-1 and HEVC played. Closing the screen saver app let the
+decoder go, and the same clips played.
+
 ## HDMI CEC devices (G3, webOS 9.2.2)
 
 `com.webos.service.eim/getAllInputStatus` returns CEC devices in each HDMI
